@@ -1,1 +1,248 @@
+# 对于5*5的网格世界求解BOE的代码
 
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from enum import Enum
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional
+
+
+# ==========================================
+# 1. 基础配置与枚举 (Configuration & Enums)
+# ==========================================
+
+class Action(Enum):
+    """定义动作枚举，方便代码阅读"""
+    UP = (-1, 0)
+    DOWN = (1, 0)
+    LEFT = (0, -1)
+    RIGHT = (0, 1)
+
+
+@dataclass
+class State:
+    """定义状态，使用(row, col)表示"""
+    row: int
+    col: int
+
+    def to_tuple(self) -> Tuple[int, int]:
+        return (self.row, self.col)
+
+
+# 全局配置参数
+GRID_SIZE = 5
+GAMMA = 0.9  # 折扣因子
+REWARD_TARGET = 1.0  # 到达目标奖励
+REWARD_PENALTY = -1.0  # 撞墙/禁区惩罚
+TOLERANCE = 1e-4  # 收敛阈值 theta
+
+
+# ==========================================
+# 2. 环境模型 (Environment Model)
+#    负责定义物理规则：哪里是墙？撞墙会怎样？
+# ==========================================
+
+class GridWorldEnv:
+    def __init__(self):
+        self.size = GRID_SIZE
+        # 目标位置 (0-indexed): 对应图中蓝色区域 (Row 4, Col 3) -> Index (3, 2)
+        self.target_pos = (3, 2)
+
+        # 禁止区域 (0-indexed): 对应图中橙色区域
+        self.forbidden_pos = {
+            (1, 1), (1, 2),
+            (2, 2),
+            (3, 1), (3, 3),
+            (4, 1)
+        }
+
+    def is_forbidden(self, r: int, c: int) -> bool:
+        return (r, c) in self.forbidden_pos
+
+    def is_out_of_bounds(self, r: int, c: int) -> bool:
+        return not (0 <= r < self.size and 0 <= c < self.size)
+
+    def get_transition(self, state: Tuple[int, int], action: Action) -> Tuple[Tuple[int, int], float]:
+        """
+        核心物理引擎：输入状态和动作，返回(下一个状态, 奖励)
+        对应公式中的: p(s'|s,a) 和 r(s,a)
+        """
+        r, c = state
+        dr, dc = action.value
+        next_r, next_c = r + dr, c + dc
+
+        # 逻辑 1: 如果当前已经是目标，通常视为终止状态 (Terminal)，不再移动
+        # 在值迭代循环中，我们通常会跳过对 Terminal State 的计算
+        if state == self.target_pos:
+            return state, 0.0
+
+        # 逻辑 2: 碰撞检测 (边界 或 禁止区)
+        # 物理规则：撞墙后反弹回原处 (next_s = s)，并给予负奖励
+        if self.is_out_of_bounds(next_r, next_c) or self.is_forbidden(next_r, next_c):
+            return state, REWARD_PENALTY
+
+        # 逻辑 3: 到达目标
+        if (next_r, next_c) == self.target_pos:
+            return (next_r, next_c), REWARD_TARGET
+
+        # 逻辑 4: 普通移动 (白色区域)
+        return (next_r, next_c), 0.0
+
+
+# ==========================================
+# 3. 核心算法：值迭代 (Value Iteration)
+#    负责数学计算：Bellman Optimality Equation
+# ==========================================
+
+class ValueIterationSolver:
+    def __init__(self, env: GridWorldEnv):
+        self.env = env
+        # 初始化 V(s) 为 0
+        self.V = np.zeros((env.size, env.size))
+        # 初始化策略 Pi(s)
+        self.policy: Dict[Tuple[int, int], Action] = {}
+
+    def get_q_value(self, state: Tuple[int, int], action: Action) -> float:
+        """
+        计算 Q(s, a)
+        公式: q_k(s, a) = R(s,a) + gamma * V_k(s')
+        """
+        next_state, reward = self.env.get_transition(state, action)
+        next_r, next_c = next_state
+
+        # 获取 V_k(s')，如果是目标状态，V通常保持为0(因为它终止了)，或者根据具体定义
+        # 这里直接取表中的值 (迭代过程中 V 会更新)
+        v_prime = self.V[next_r, next_c]
+
+        return reward + GAMMA * v_prime
+
+    def iterate(self) -> float:
+        """
+        执行一次完整的迭代 (Sweep)
+        返回: 最大的价值变化量 delta
+        """
+        new_V = np.copy(self.V)
+        max_delta = 0.0
+
+        # 遍历每一个状态 s
+        for r in range(self.env.size):
+            for c in range(self.env.size):
+                state = (r, c)
+
+                # 跳过目标状态和禁止区域 (它们不需要更新 V 值)
+                # 目标状态 V=0 (终止)，禁止区域无法停留
+                if state == self.env.target_pos or state in self.env.forbidden_pos:
+                    continue
+
+                # --- 步骤 1: 计算所有动作的 Q 值 ---
+                q_values = {}
+                for action in Action:
+                    q_values[action] = self.get_q_value(state, action)
+
+                # --- 步骤 2: 找到最大 Q 值 (Greedy) ---
+                # 公式: v_{k+1}(s) = max_a q_k(a, s)
+                best_action = max(q_values, key=q_values.get)  # type: ignore
+                best_value = q_values[best_action]
+
+                # --- 步骤 3: 更新价值表和策略 ---
+                new_V[r, c] = best_value
+                self.policy[state] = best_action
+
+                # 记录变化幅度
+                max_delta = max(max_delta, abs(best_value - self.V[r, c]))
+
+        self.V = new_V
+        return max_delta
+
+    def run(self, max_iters=100):
+        print(f"{'Iteration':<10} | {'Max Delta':<15}")
+        print("-" * 30)
+
+        for i in range(max_iters):
+            delta = self.iterate()
+            print(f"{i + 1:<10} | {delta:.6f}")
+
+            # 绘制中间过程 (可选，这里只在最后绘制)
+            # plot_grid(self.env, self.V, self.policy, title=f"Iter {i+1}")
+
+            if delta < TOLERANCE:
+                print(f"\n算法收敛于第 {i + 1} 次迭代！")
+                break
+        return self.V, self.policy
+
+
+# ==========================================
+# 4. 可视化模块 (Visualization)
+# ==========================================
+
+def plot_results(env: GridWorldEnv, V: np.ndarray, policy: Dict, title: str):
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    # 绘制每一个格子
+    for r in range(env.size):
+        for c in range(env.size):
+            state = (r, c)
+
+            # 1. 设置颜色
+            color = 'white'
+            if state == env.target_pos:
+                color = '#4FC3F7'  # 浅蓝 (Target)
+            elif state in env.forbidden_pos:
+                color = '#FFB74D'  # 橙色 (Forbidden)
+
+            # 绘制方块
+            rect = patches.Rectangle((c, env.size - 1 - r), 1, 1,
+                                     linewidth=1, edgecolor='grey', facecolor=color)
+            ax.add_patch(rect)
+
+            # 2. 显示 V 值
+            if state not in env.forbidden_pos:
+                text_val = f"{V[r, c]:.2f}"
+                if state == env.target_pos:
+                    text_val = "GOAL"
+
+                ax.text(c + 0.5, env.size - 1 - r + 0.5, text_val,
+                        ha='center', va='center', fontsize=10, fontweight='bold')
+
+            # 3. 绘制策略箭头 (修正版)
+            if state in policy and state not in env.forbidden_pos and state != env.target_pos:
+                act = policy[state]
+                dr, dc = act.value  # dr:行变动, dc:列变动
+
+                # --- 核心修正 ---
+                # 绘图 X 轴增量 = 列变动 (dc)
+                # 绘图 Y 轴增量 = 行变动的相反数 (-dr)
+                arrow_dx = dc * 0.3
+                arrow_dy = -dr * 0.3
+
+                # 计算箭头的起点 (中心点 - 一半的向量，为了居中)
+                start_x = c + 0.5 - arrow_dx / 2
+                start_y = (env.size - 1 - r) + 0.5 - arrow_dy / 2
+
+                ax.arrow(start_x, start_y, arrow_dx, arrow_dy,
+                         head_width=0.1, head_length=0.1, fc='green', ec='green')
+
+    ax.set_xlim(0, env.size)
+    ax.set_ylim(0, env.size)
+    ax.set_title(title, fontsize=14)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    plt.show()
+
+# ==========================================
+# 5. 主程序入口
+# ==========================================
+
+if __name__ == "__main__":
+    # 1. 创建环境
+    env = GridWorldEnv()
+
+    # 2. 创建求解器
+    solver = ValueIterationSolver(env)
+
+    # 3. 运行算法
+    final_V, final_policy = solver.run()
+
+    # 4. 可视化结果
+    plot_results(env, final_V, final_policy, "Optimal Policy (Value Iteration)")
