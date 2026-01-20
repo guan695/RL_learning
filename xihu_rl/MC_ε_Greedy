@@ -1,0 +1,332 @@
+import numpy as np
+import random
+import logging
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from dataclasses import dataclass, field
+from typing import List, Tuple, Dict, Set, Optional
+
+# --- 日志配置 ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - [%(levelname)s] - %(message)s",
+    datefmt="%H:%M:%S"
+)
+logger = logging.getLogger("MC_GridWorld")
+
+
+# --- 配置类 (Configuration) ---
+@dataclass
+class Config:
+    """
+    全局配置类，管理环境参数、算法超参数及可视化设置。
+    """
+    # 环境参数
+    rows: int = 5
+    cols: int = 5
+    target_state: Tuple[int, int] = (3, 2)  # (Row, Col) 0-indexed
+    forbidden_states: Set[Tuple[int, int]] = field(default_factory=lambda: {
+        (1, 1), (1, 2), (2, 2), (3, 1), (3, 3), (4, 1)
+    })
+
+    # 奖励机制
+    r_boundary: float = -1.0
+    r_forbidden: float = -1.0
+    r_target: float = 1.0
+    r_step: float = -0.05
+
+    # MC算法参数
+    gamma: float = 0.9
+    episodes: int = 10000  # 总训练轮数
+    epsilon_start: float = 1.0  # 初始探索率
+    epsilon_end: float = 0.05  # 最终探索率
+    # 动态计算衰减率，使得在训练中段降至较低水平
+    epsilon_decay: float = 0.9996
+
+    # 可视化参数
+    vis_interval: int = 50  # 每多少个 Episode 刷新一次画面
+    vis_pause: float = 0.01  # 刷新时的暂停时间(秒)
+
+    # [新增] 学习率。替代平均值法，让 Agent 更关注最近的经验。
+    # 经验值：MC方法通常设得比较小，0.01 ~ 0.05 之间
+    alpha: float = 0.02
+
+
+# --- 环境层 (Domain Model) ---
+class GridWorldEnv:
+    """
+    网格世界环境，处理状态转移与奖励。
+    """
+
+    def __init__(self, config: Config):
+        self.cfg = config
+        # 动作空间: 0:上, 1:下, 2:左, 3:右
+        self.actions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        self.n_actions = len(self.actions)
+
+    def reset(self) -> Tuple[int, int]:
+        """随机初始化起点 (Avoiding target & forbidden)。"""
+        while True:
+            r = random.randint(0, self.cfg.rows - 1)
+            c = random.randint(0, self.cfg.cols - 1)
+            state = (r, c)
+            if state != self.cfg.target_state and state not in self.cfg.forbidden_states:
+                return state
+
+    def step(self, state: Tuple[int, int], action_idx: int) -> Tuple[Tuple[int, int], float, bool]:
+        """环境交互核心逻辑。"""
+        if state == self.cfg.target_state:
+            return state, 0.0, True
+
+        r, c = state
+        dr, dc = self.actions[action_idx]
+        nr, nc = r + dr, c + dc
+        next_state = (nr, nc)
+
+        # 1. 边界处理
+        if not (0 <= nr < self.cfg.rows and 0 <= nc < self.cfg.cols):
+            return state, self.cfg.r_boundary, False
+
+        # 2. 禁区处理
+        if next_state in self.cfg.forbidden_states:
+            return state, self.cfg.r_forbidden, False
+
+        # 3. 目标处理
+        if next_state == self.cfg.target_state:
+            return next_state, self.cfg.r_target, True
+
+        # 4. 普通移动
+        return next_state, self.cfg.r_step, False
+
+
+# --- 算法层 (Service Layer) ---
+class MCAgent:
+    """
+    Monte Carlo Agent，严格遵循伪代码逻辑。
+    """
+
+    def __init__(self, env: GridWorldEnv, config: Config):
+        self.env = env
+        self.cfg = config
+        self.epsilon = config.epsilon_start
+
+        # Q表: [Rows, Cols, Actions]
+        self.q_table = np.zeros((config.rows, config.cols, env.n_actions))
+
+        # Returns: 记录回报历史。Key: (row, col, action), Value: List[returns]
+        # 注意：为了性能，工程上常仅存 sum 和 count，但为了完全符合伪代码 "Returns(st, at) <- ... + g" 和 "average(...)"
+        # 我们使用列表存储，尽管这会消耗更多内存。
+        self.returns: Dict[Tuple[int, int, int], List[float]] = {}
+
+    def _get_action_probs(self, state: Tuple[int, int]) -> np.ndarray:
+        """
+        计算动作概率分布 π(a|s)。
+        严格对应伪代码公式:
+        π(a|s) = 1 - (|A|-1)/|A| * ε   (if a == a*)
+        π(a|s) = 1/|A| * ε             (if a != a*)
+        """
+        r, c = state
+        n_a = self.env.n_actions
+
+        # 找到最佳动作 a* (随机打破平局)
+        q_vals = self.q_table[r, c]
+        max_q = np.max(q_vals)
+        best_actions = np.flatnonzero(q_vals == max_q)
+        a_star = np.random.choice(best_actions)
+
+        probs = np.zeros(n_a)
+        for a in range(n_a):
+            if a == a_star:
+                probs[a] = 1 - ((n_a - 1) / n_a) * self.epsilon
+            else:
+                probs[a] = (1 / n_a) * self.epsilon
+        return probs
+
+    def select_action(self, state: Tuple[int, int]) -> int:
+        """根据当前策略 π 采样动作。"""
+        probs = self._get_action_probs(state)
+        return np.random.choice(self.env.n_actions, p=probs)
+
+    def update(self, episode: List[Tuple[Tuple[int, int], int, float]]):
+        """执行 First-visit MC 更新。"""
+        G = 0.0
+        visited_sa = set()
+
+        # 为了高效判断 First-visit，预处理首次出现索引
+        first_visit_idx = {}
+        for idx, (s, a, _) in enumerate(episode):
+            if (s, a) not in first_visit_idx:
+                first_visit_idx[(s, a)] = idx
+
+        # 逆序遍历
+        for t in range(len(episode) - 1, -1, -1):
+            s, a, r = episode[t]
+            G = self.cfg.gamma * G + r
+
+            # First-visit Check
+            if t == first_visit_idx[(s, a)]:
+                r_idx, c_idx = s
+                old_q = self.q_table[r_idx, c_idx, a]
+                # Q_new = Q_old + alpha * (Target - Q_old)
+                self.q_table[r_idx, c_idx, a] = old_q + self.cfg.alpha * (G - old_q)
+
+    def decay_epsilon(self):
+        """衰减探索率 (GLIE Requirement)。"""
+        self.epsilon = max(self.cfg.epsilon_end, self.epsilon * self.cfg.epsilon_decay)
+
+
+# --- 视图层 (Visualizer) ---
+class GridWorldVisualizer:
+    """
+    负责基于 Matplotlib 的动态可视化绘制。
+    """
+
+    def __init__(self, env: GridWorldEnv, config: Config):
+        self.env = env
+        self.cfg = config
+
+        # 初始化绘图窗口
+        plt.ion()  # 开启交互模式
+        self.fig, self.ax = plt.subplots(figsize=(6, 6))
+        self.arrow_patches = []
+
+        # 绘制静态背景
+        self._draw_static_elements()
+
+    def _draw_static_elements(self):
+        """绘制网格、禁区和目标点。"""
+        self.ax.set_xlim(0, self.cfg.cols)
+        self.ax.set_ylim(0, self.cfg.rows)
+
+        # 设置坐标轴
+        self.ax.set_xticks(np.arange(0, self.cfg.cols + 1, 1))
+        self.ax.set_yticks(np.arange(0, self.cfg.rows + 1, 1))
+        self.ax.grid(True, color='black', linewidth=1)
+
+        # 坐标系转换：Matplotlib 原点在左下，矩阵在左上
+        # 我们使用 invert_yaxis 让视觉与矩阵索引一致
+        self.ax.invert_yaxis()
+        self.ax.xaxis.tick_top()
+
+        # 绘制禁区 (Orange)
+        for r, c in self.cfg.forbidden_states:
+            rect = patches.Rectangle((c, r), 1, 1, facecolor='orange', alpha=0.8)
+            self.ax.add_patch(rect)
+
+        # 绘制目标 (Blue)
+        tr, tc = self.cfg.target_state
+        rect = patches.Rectangle((tc, tr), 1, 1, facecolor='#00BFFF', alpha=0.8)  # DeepSkyBlue
+        self.ax.add_patch(rect)
+        self.ax.text(tc + 0.5, tr + 0.5, 'Target', ha='center', va='center', color='white', fontweight='bold')
+
+    def update_plot(self, q_table: np.ndarray, episode_num: int, epsilon: float):
+        """
+        根据当前的 Q 表更新箭头方向。
+        """
+        self.ax.set_title(f"Episode: {episode_num} | Epsilon: {epsilon:.4f}\nDynamic Policy Visualization", fontsize=12)
+
+        # 清除旧箭头
+        for arrow in self.arrow_patches:
+            arrow.remove()
+        self.arrow_patches.clear()
+
+        # 遍历网格绘制新箭头
+        for r in range(self.cfg.rows):
+            for c in range(self.cfg.cols):
+                state = (r, c)
+                if state == self.cfg.target_state or state in self.cfg.forbidden_states:
+                    continue
+
+                # 获取该状态下 Q 值最大的动作
+                q_vals = q_table[r, c]
+                # 如果 Q 值全为 0 (未探索)，则不画
+                if np.all(q_vals == 0):
+                    continue
+
+                best_action = np.argmax(q_vals)
+
+                # 动作映射可视化方向
+                # 0:上, 1:下, 2:左, 3:右
+                # 注意：由于 y 轴已翻转 (invert_yaxis)，y 增加是向下，y 减小是向上
+                dx, dy = 0, 0
+                if best_action == 0:
+                    dy = -0.3  # 上
+                elif best_action == 1:
+                    dy = 0.3  # 下
+                elif best_action == 2:
+                    dx = -0.3  # 左
+                elif best_action == 3:
+                    dx = 0.3  # 右
+
+                arrow = patches.FancyArrow(
+                    c + 0.5, r + 0.5, dx, dy,
+                    width=0.05, head_width=0.2, color='green'
+                )
+                self.ax.add_patch(arrow)
+                self.arrow_patches.append(arrow)
+
+        # 刷新画布
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+        plt.pause(self.cfg.vis_pause)
+
+    def close(self):
+        plt.ioff()
+        plt.show()
+
+
+# --- 控制层 (Controller) ---
+def main():
+    config = Config()
+    env = GridWorldEnv(config)
+    agent = MCAgent(env, config)
+
+    # 初始化可视化
+    try:
+        vis = GridWorldVisualizer(env, config)
+        logger.info(f"训练开始... 总 Episode 数: {config.episodes}")
+        logger.info("请观察弹出的 Matplotlib 窗口。")
+
+        for i in range(1, config.episodes + 1):
+            # 1. 生成 Episode
+            episode = []
+            state = env.reset()
+            # Exploring Starts (可选，伪代码并未强制，但通常对 MC 有帮助)
+            # 这里我们遵循伪代码 "Randomly select a starting state-action pair"
+            # 第一步完全随机选择动作，后续遵循策略
+            action = np.random.randint(0, env.n_actions)
+
+            steps = 0
+            while True:
+                next_state, reward, done = env.step(state, action)
+                episode.append((state, action, reward))
+
+                if done or steps > 100:  # 防止早期死循环
+                    break
+
+                state = next_state
+                action = agent.select_action(state)  # 后续遵循 π
+                steps += 1
+
+            # 2. 策略评估与改进 (MC Update)
+            agent.update(episode)
+
+            # 3. 衰减 Epsilon
+            agent.decay_epsilon()
+
+            # 4. 可视化更新
+            if i % config.vis_interval == 0 or i == 1:
+                vis.update_plot(agent.q_table, i, agent.epsilon)
+
+        logger.info("训练完成。")
+        vis.close()
+
+    except KeyboardInterrupt:
+        logger.warning("用户中断训练。")
+    except Exception as e:
+        logger.error(f"发生错误: {e}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
